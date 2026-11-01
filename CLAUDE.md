@@ -22,6 +22,46 @@ Integration tests (`npm run test:integration`) and Playwright e2e tests (`npm ru
 - After any code change: run `npm test`
 - To verify Electron-feature bindings (dialog boxes, OS interactions): run `npm run dev` — no additional setup needed, `settings.json` controls where the renderer bundle comes from
 
+## Running with local web-ui / services / devices
+
+By default the app runs the **published** web bundle: on every launch the AutoUpdate module
+downloads the current bundle into `<userData>/react` (`~/.config/Incyclist` on Linux) and loads it.
+Patching that bundle doesn't work, since it is replaced at the next launch. To run the app with
+changes from the sibling repos (`../web-ui`, `../services`, `../devices`), use:
+
+```bash
+npm run dev:local                         # build devices + services + web-ui, then start the app
+npm run dev:local -- --skip-build         # start again with the last local build
+npm run dev:local -- --keep               # keep using the local build on later plain starts
+npm run dev:local -- --remote-debugging-port=9223   # other arguments go to electron
+npm run dev:local -- --mock-zwift-play   # adds a simulated Zwift Play (web-ui bindings/devices/mock)
+npm run dev:local -- --devtools          # also opens the DevTools (inspector)
+```
+
+What `scripts/run-local.js` does:
+
+1. For `devices` and `services` (each optional; skipped if the repo isn't there): `npm run build`,
+   then copies its `lib/` over `../web-ui/node_modules/incyclist-<name>/lib`. The production web-ui
+   build bundles whatever is in its `node_modules`, so this is how library changes get in.
+2. Builds web-ui (`npm run build` → `../web-ui/build`).
+3. Sets `"pageUrl": "file:///…/web-ui/build/index.html#ride"` in `<userData>/settings.json`. With
+   `pageUrl` set, the app loads that page and skips the web bundle update check.
+4. Starts the app with `DEBUG=1` (renderer logs, devices/services included, go to stdout; the
+   DevTools only open with `--devtools`), and
+   removes `pageUrl` again when the app exits (unless `--keep`).
+
+Notes:
+
+- `npm ci` in web-ui overwrites the copied libraries again; just re-run `npm run dev:local`.
+- Unit tests in web-ui need `CI=1 npx vitest run --project unit`: in dev mode its Vite config
+  aliases `incyclist-services`/`incyclist-devices` to `../services/lib/esm` and `../devices/lib/esm`,
+  so without `CI=1` both sibling repos must be built.
+- Don't reload the renderer (Ctrl+R / `location.reload()`): the before-unload handler quits the app.
+  Restart it instead.
+- For end-to-end checks with a debugger attached, start the app with
+  `npx electron ./ --remote-debugging-port=9223` instead. The page can then be inspected over the
+  Chrome DevTools Protocol at `http://127.0.0.1:9223/json`.
+
 ## Language
 
 **JavaScript only.** Do not introduce TypeScript files. TypeScript migration is a future task that requires its own build infrastructure (tsconfig, compile step, ts-jest). Until that task is started, all new code must be `.js`.

@@ -67,7 +67,8 @@ class MainWindow {
             } 
         })
         this.win.removeMenu();
-        if (process.env.DEBUG) {
+        // DEBUG also turns on the renderer logs; NO_DEVTOOLS keeps those without the inspector
+        if (process.env.DEBUG && !process.env.NO_DEVTOOLS) {
             this.win.webContents.openDevTools();
                     
         }

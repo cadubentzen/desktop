@@ -15,6 +15,7 @@
     "app-test": "playwright test --workers 1",
     "start": "electron ./",
     "dev": "DEBUG=1  electron ./",
+    "dev:local": "node scripts/run-local.js",
     "forge-start": "electron-forge start",
     "package": "electron-forge package",
     "make": "electron-forge make",
