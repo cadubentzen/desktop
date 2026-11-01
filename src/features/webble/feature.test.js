@@ -245,6 +245,23 @@ describe('WebBleFeature — _inCooldown / reportProbeFailed', () => {
         expect(feature.deviceCache.recordFailure).not.toHaveBeenCalled()
     })
 
+    test('reportProbeFailed makes the device eligible for approval again in the same scan', () => {
+        feature.discoveredDeviceIds.add('aa')
+        feature.reportProbeFailed('aa', 'HRM-Pro')
+        expect(feature.discoveredDeviceIds.has('aa')).toBe(false)
+    })
+
+    test('a wanted device whose probe failed is re-approved on the next chooser round', () => {
+        feature.scanning = true
+        feature.connectTargetMacs.add('aa')
+        feature._approve({ deviceId: 'aa', deviceName: 'HRM-Pro' }, jest.fn())
+        feature.reportProbeFailed('aa', 'HRM-Pro')
+
+        const cb = jest.fn()
+        feature._onSelectBluetoothDevice({ preventDefault: jest.fn() }, [{ deviceId: 'aa', deviceName: 'HRM-Pro' }], cb)
+        expect(cb).toHaveBeenCalledWith('aa')
+    })
+
 })
 
 // ── reportConnectSucceeded ───────────────────────────────────────────────────────
@@ -512,6 +529,16 @@ describe('WebBleFeature — _onSelectBluetoothDevice', () => {
         expect(feature.pendingCallback).toBe(cb)
     })
 
+    test('scanning: among wanted devices, one that never failed its probe goes before a recently failed one', () => {
+        feature.scanning = true
+        feature.connectTargetMacs.add('aa')
+        feature.connectTargetMacs.add('bb')
+        feature.lastProbeFailure.set('aa', Date.now())
+        const cb = jest.fn()
+        feature._onSelectBluetoothDevice(makeEvent(), makeDeviceList('aa', 'bb'), cb)
+        expect(cb).toHaveBeenCalledWith('bb')
+    })
+
     test('scanning: a device persisted as good wins over an earlier, unclassified device in the same list', () => {
         feature.scanning = true
         feature.deviceCache.isGood.mockImplementation(id => id === 'bb')
@@ -672,6 +699,20 @@ describe('WebBleFeature — takeApproved', () => {
 })
 
 // ── getMac ────────────────────────────────────────────────────────────────────
+
+describe('WebBleFeature — isWantedDevice', () => {
+
+    test('true for a device persisted as good or explicitly requested this session', () => {
+        const feature = new WebBleFeature()
+        feature.deviceCache.isGood.mockImplementation(id => id === 'aa')
+        feature.connectTargetMacs.add('bb')
+        expect(feature.isWantedDevice('aa')).toBe(true)
+        expect(feature.isWantedDevice('bb')).toBe(true)
+        expect(feature.isWantedDevice('cc')).toBe(false)
+        expect(feature.isWantedDevice(null)).toBe(false)
+    })
+
+})
 
 describe('WebBleFeature — getMac', () => {
 

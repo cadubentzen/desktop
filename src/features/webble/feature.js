@@ -56,10 +56,19 @@ class WebBleFeature extends Feature {
         // expense of other devices. Also not reset by startScan() — that reset is
         // exactly what let a persistently-failing device win every fresh scan cycle.
         this.probeCooldowns = new Map()
+        // deviceId → timestamp of its last failed probe; orders retries of wanted
+        // devices so one persistently failing device can't starve the others
+        this.lastProbeFailure = new Map()
 
         this._scanLoopTimeout = null
         this._iterationInFlight = false
         this._lastLoggedDeviceIds = null
+
+        // timing diagnostics
+        this._scanStartedAt = 0
+        this._iterationStartedAt = 0
+        this._iterationCount = 0
+        this._connectRequestedAt = new Map()  // deviceId → ts of connect()
     }
 
     static getInstance() {
@@ -120,6 +129,11 @@ class WebBleFeature extends Feature {
      * sessions eventually blacklist a device outright (see device-cache.js).
      */
     reportProbeFailed(deviceId, deviceName) {
+        // the device was approved (and so marked as discovered) for this probe — make
+        // it eligible again, otherwise it could never be retried during this scan
+        this.discoveredDeviceIds.delete(deviceId)
+        this.lastProbeFailure.set(deviceId, Date.now())
+
         if (this.connectTargetMacs.has(deviceId)) {
             this.logger.logEvent({ message: 'probe failed, retrying eagerly (explicitly requested device)', deviceId })
             return
@@ -163,7 +177,16 @@ class WebBleFeature extends Feature {
         }
         this.lastApproved = { deviceId: device.deviceId, deviceName: device.deviceName ?? null }
         this.pendingCallback = null
-        this.logger.logEvent({ message: 'approving device', deviceId: device.deviceId, deviceName: device.deviceName })
+        const now = Date.now()
+        const connectRequestedAt = this._connectRequestedAt.get(device.deviceId)
+        this._connectRequestedAt.delete(device.deviceId)
+        this.logger.logEvent({
+            message: 'approving device', deviceId: device.deviceId, deviceName: device.deviceName,
+            iteration: this._iterationCount,
+            iterationMs: this._iterationStartedAt ? now - this._iterationStartedAt : undefined,
+            sinceScanStartMs: this.scanning && this._scanStartedAt ? now - this._scanStartedAt : undefined,
+            sinceConnectRequestMs: connectRequestedAt ? now - connectRequestedAt : undefined,
+        })
         callback(device.deviceId)
     }
 
@@ -190,6 +213,8 @@ class WebBleFeature extends Feature {
                 connectTarget: this.connectTargetId,
                 devices: deviceList.length,
                 ids: deviceList.map(d => d.deviceId),
+                names: deviceList.map(d => d.deviceName ?? null),
+                iterationMs: this._iterationStartedAt ? Date.now() - this._iterationStartedAt : undefined,
             })
         }
 
@@ -213,9 +238,12 @@ class WebBleFeature extends Feature {
                 !this.deviceCache.isBad(d.deviceId))
 
             // tier 1: a device we already know we want (this session or a previous
-            // one) always wins, regardless of chooser order or cooldown.
-            let newDevice = candidates.find(d =>
-                this.connectTargetMacs.has(d.deviceId) || this.deviceCache.isGood(d.deviceId))
+            // one) always wins, regardless of chooser order or cooldown. Among those,
+            // the one that failed its probe longest ago (or never) goes first.
+            const lastFailure = (d) => this.lastProbeFailure.get(d.deviceId) ?? 0
+            let newDevice = candidates
+                .filter(d => this._isWanted(d.deviceId))
+                .sort((a, b) => lastFailure(a) - lastFailure(b))[0]
             // tier 2: anything not currently cooled down from a recent probe failure.
             if (!newDevice) newDevice = candidates.find(d => !this._inCooldown(d.deviceId))
             // tier 3: nothing better available this round — try a parked/cooled-down
@@ -238,9 +266,22 @@ class WebBleFeature extends Feature {
         }
     }
 
+    /**
+     * Whether a device is one we already use (this session or a previous one).
+     * Called (via sync IPC) by the renderer to pick the probe strategy.
+     */
+    isWantedDevice(deviceId) {
+        return !!deviceId && this._isWanted(deviceId)
+    }
+
+    _isWanted(deviceId) {
+        return this.connectTargetMacs.has(deviceId) || this.deviceCache.isGood(deviceId)
+    }
+
     startScan(serviceUUIDs, allowDuplicates) {
         this.logger.logEvent({ message: 'startScan', serviceUUIDs, allowDuplicates })
         this.scanning = true
+        this._scanStartedAt = Date.now()
         this.pendingCallback = null
         this.discoveredDeviceIds = new Set()
         this._lastLoggedDeviceIds = null
@@ -266,7 +307,8 @@ class WebBleFeature extends Feature {
     }
 
     connect(deviceId) {
-        this.logger.logEvent({ message: 'connect', deviceId })
+        this.logger.logEvent({ message: 'connect', deviceId, hasPendingChooser: !!this.pendingCallback, iterationInFlight: this._iterationInFlight })
+        this._connectRequestedAt.set(deviceId, Date.now())
         this.connectTargetMacs.add(deviceId)
         this.deviceCache.markGood(deviceId)
         this.connectTargetId = deviceId
@@ -335,13 +377,23 @@ class WebBleFeature extends Feature {
         })()`
 
         this._iterationInFlight = true
+        this._iterationStartedAt = Date.now()
+        this._iterationCount++
         this._scanLoopTimeout = null
+        // a new chooser starts with an empty device list
+        this.lastDeviceList = []
         webContents.executeJavaScript(script, true)
             .then(() => this._onIterationDone(500))
-            .catch(() => this._onIterationDone(2000))
+            .catch((err) => this._onIterationDone(2000, err))
     }
 
-    _onIterationDone(delay) {
+    _onIterationDone(delay, err) {
+        this.logger.logEvent({
+            message: 'scan iteration done',
+            iteration: this._iterationCount,
+            durationMs: this._iterationStartedAt ? Date.now() - this._iterationStartedAt : undefined,
+            error: err?.message,
+        })
         this._iterationInFlight = false
         if (this._shouldLoop())
             this._scanLoopTimeout = setTimeout(() => this._triggerScanIteration(), delay)
@@ -366,6 +418,7 @@ class WebBleFeature extends Feature {
         ipcHandleNoResponse('webble-disconnect', this.disconnect.bind(this), ipcMain)
         ipcHandleSync('webble-get-mac', this.getMac.bind(this), ipcMain)
         ipcHandleSync('webble-take-approved', this.takeApproved.bind(this), ipcMain)
+        ipcHandleSync('webble-is-wanted', this.isWantedDevice.bind(this), ipcMain)
         ipcHandleNoResponse('webble-probe-failed', this.reportProbeFailed.bind(this), ipcMain)
         ipcHandleNoResponse('webble-connect-succeeded', this.reportConnectSucceeded.bind(this), ipcMain)
         ipcHandleNoResponse('webble-unsupported-device', this.reportUnsupportedDevice.bind(this), ipcMain)
@@ -401,6 +454,7 @@ class WebBleFeature extends Feature {
 
         spec.webble.getMac = ipcCallSync('webble-get-mac', ipcRenderer)
         spec.webble.takeApproved = ipcCallSync('webble-take-approved', ipcRenderer)
+        spec.webble.isWantedDevice = ipcCallSync('webble-is-wanted', ipcRenderer)
         spec.webble.reportProbeFailed = ipcCallNoResponse('webble-probe-failed', ipcRenderer)
         spec.webble.reportConnectSucceeded = ipcCallNoResponse('webble-connect-succeeded', ipcRenderer)
         spec.webble.reportUnsupportedDevice = ipcCallNoResponse('webble-unsupported-device', ipcRenderer)

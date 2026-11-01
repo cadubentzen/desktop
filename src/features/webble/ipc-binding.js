@@ -59,7 +59,16 @@ class WebBleIpcBinding extends EventEmitter {
         this._optionalServices = [...FITNESS_SERVICE_UUIDS_FULL]
 
         // timeouts / retries (instance fields so tests can shorten them)
-        this._probeTimeoutMs = 10000
+        // service discovery waits for BlueZ to resolve the device's complete GATT
+        // database — e.g. a Garmin HRM-Pro takes 10-15s for that on its own
+        this._probeTimeoutMs = 30000
+        // A device we already use gets far longer: once its connection interval has
+        // been raised to save power (e.g. ~2s for a Garmin HRM-Pro — the Linux kernel
+        // re-uses a peripheral's last requested interval for the next connection),
+        // reading its services takes 1-2 minutes. Giving up restarts discovery from
+        // scratch, so a shorter timeout would never succeed.
+        this._knownDeviceProbeTimeoutMs = 150000
+        this._slowDiscoveryLogMs = 20000
         this._gattConnectTimeoutMs = 10000
         this._gattConnectRetries = 3
         this._gattRetryDelayMs = 500
@@ -278,6 +287,33 @@ class WebBleIpcBinding extends EventEmitter {
         // has been handed over; don't delay the connection with a GATT probe.
         if (hadPendingConnect) return
 
+        if (entry.probing) {
+            this._log({ message: 'probe already running', device: device.name, debug: true })
+            return
+        }
+
+        // A device we already use may take minutes to probe (see _knownDeviceProbeTimeoutMs)
+        // — run its probe in the background, so the scan loop keeps discovering the
+        // user's other devices meanwhile instead of queueing behind it.
+        const known = !!entry.mac && !!this.getApi().isWantedDevice?.(entry.mac)
+        const probe = this._probeAndAnnounce(device, entry, approved, known)
+        if (known) {
+            probe.catch(err => this._log({ message: 'background probe failed', device: device.name, error: err?.message }))
+            return
+        }
+        await probe
+    }
+
+    async _probeAndAnnounce(device, entry, approved, known) {
+        entry.probing = true
+        try {
+            await this._probeAndAnnounceDevice(device, entry, approved, known)
+        } finally {
+            entry.probing = false
+        }
+    }
+
+    async _probeAndAnnounceDevice(device, entry, approved, known) {
         // Every device is probed live, even a known-good one — some devices (e.g. a
         // rower whose FTMS service only appears once its GATT server has fully
         // initialised) report different, incomplete service sets depending on
@@ -285,7 +321,8 @@ class WebBleIpcBinding extends EventEmitter {
         // risks permanently hiding a capability the device actually has, so the
         // "good" cache only ever influences chooser priority (see feature.js), never
         // what gets announced here.
-        const serviceUuids = await this._probeServices(device)
+        const timeoutMs = known ? this._knownDeviceProbeTimeoutMs : this._probeTimeoutMs
+        const serviceUuids = await this._probeServices(device, timeoutMs)
         if (serviceUuids === null) {
             // probe failed or timed out — leave probed=false so the next encounter retries.
             // Tell main so it can cool this device down instead of re-offering it (and
@@ -332,17 +369,34 @@ class WebBleIpcBinding extends EventEmitter {
      * Returns the (possibly empty) list of service UUIDs, or null when the
      * probe failed or timed out.
      */
-    async _probeServices(device) {
+    async _probeServices(device, timeoutMs = this._probeTimeoutMs) {
         this._log({ message: 'GATT connecting to', device: device.name, debug: true })
+        const t0 = Date.now()
         try {
             // reuses the same retry-with-backoff helper the real pairing connect uses
             // (_gattConnectRetries attempts) — a one-off GATT hiccup during discovery
             // shouldn't be treated as a permanent failure any more than it would be
             // when actually connecting
             const server = await this._gattConnect(device)
-            this._log({ message: 'GATT connected to', device: device.name, debug: true })
+            const connectMs = Date.now() - t0
+            this._log({ message: 'GATT connected to', device: device.name, connectMs, debug: true })
 
-            const services = await this._withTimeout(this._getServerServices(server), this._probeTimeoutMs, 'service discovery')
+            const services = await this._withTimeout(this._getServerServices(server), timeoutMs, 'service discovery')
+
+            // An empty result from a server that dropped the link during discovery says
+            // nothing about the device (e.g. a stale connection reused right after a
+            // previous probe gave up) — that's a failed probe, not an unsupported device.
+            if (services.length === 0 && device.gatt?.connected === false)
+                throw new Error('GATT server disconnected during service discovery')
+
+            const discoveryMs = Date.now() - t0 - connectMs
+            this._log({ message: 'GATT probe done', device: device.name, connectMs, discoveryMs, services: services.length, debug: true })
+            if (discoveryMs > this._slowDiscoveryLogMs) {
+                this._log({
+                    message: 'slow GATT service discovery', device: device.name, discoveryMs,
+                    hint: 'device probably runs a long (power-saving) connection interval',
+                })
+            }
 
             const serviceUuids = services.map(svc => {
                 const shortUuid = this._knownServiceUUIDs.find(u => toFullUUID(u) === svc.uuid.toLowerCase())
@@ -353,7 +407,7 @@ class WebBleIpcBinding extends EventEmitter {
             // connection is kept for an imminent connect or released
             return serviceUuids
         } catch (err) {
-            this._log({ message: 'GATT probe failed', device: device.name, error: err?.message })
+            this._log({ message: 'GATT probe failed', device: device.name, error: err?.message, durationMs: Date.now() - t0 })
             try { device.gatt.disconnect() } catch {}
             return null
         }
@@ -464,6 +518,7 @@ class WebBleIpcBinding extends EventEmitter {
     async _connectPeripheral(peripheral) {
         // peripheral.id is the MAC whenever it was known at discovery time; the cache
         // is keyed under both the MAC and the opaque id, so either form resolves here.
+        const t0 = Date.now()
         let device = this._deviceCache.get(peripheral.id)?.device
         let source = 'cache'
 
@@ -488,7 +543,7 @@ class WebBleIpcBinding extends EventEmitter {
             device = await this._waitForDevice(peripheral.id)
         }
 
-        this._log({ message: 'connectPeripheral', device: peripheral.name, source, debug: true })
+        this._log({ message: 'connectPeripheral', device: peripheral.name, source, gattConnected: !!device.gatt?.connected, waitMs: Date.now() - t0, debug: true })
 
         // claim the device: a probe connection kept alive for this device is reused,
         // and the grace-period release must not tear down an in-use connection
@@ -503,7 +558,7 @@ class WebBleIpcBinding extends EventEmitter {
 
         peripheral._server = await this._gattConnect(device)
         peripheral.state = 'connected'
-        this._log({ message: 'connectPeripheral done', device: peripheral.name, debug: true })
+        this._log({ message: 'connectPeripheral done', device: peripheral.name, source, durationMs: Date.now() - t0, debug: true })
 
         // The real "this MAC is a device we actually use" signal — hit regardless of
         // which source resolved it above (unlike feature.js's connect(), which is
@@ -643,6 +698,7 @@ class WebBleIpcBinding extends EventEmitter {
     }
 
     async _discoverServicesAndCharacteristics(peripheral, serviceUUIDs, characteristicUUIDs) {
+        const t0 = Date.now()
         if (!await this._ensureServer(peripheral)) return { services: [], characteristics: [] }
 
         let result = await this._collectServicesAndCharacteristics(peripheral, serviceUUIDs, characteristicUUIDs)
@@ -650,6 +706,12 @@ class WebBleIpcBinding extends EventEmitter {
             result = await this._collectServicesAndCharacteristics(peripheral, serviceUUIDs, characteristicUUIDs)
 
         peripheral._characteristics = result.characteristics
+        this._log({
+            message: 'discoverServicesAndCharacteristics done', device: peripheral.name,
+            requestedServices: serviceUUIDs?.length ?? 0, requestedCharacteristics: characteristicUUIDs?.length ?? 0,
+            services: result.services.length, characteristics: result.characteristics.length,
+            durationMs: Date.now() - t0, debug: true
+        })
         return result
     }
 
@@ -692,6 +754,7 @@ class WebBleIpcBinding extends EventEmitter {
             _peripheralId:  peripheral.id,
             properties:     this._extractProperties(bleChar.properties),
             _bleChar:       bleChar,
+            _peripheral:    peripheral,
 
             emit:               (ev, ...a)  => emitter.emit(ev, ...a),
             on:                 (ev, cb)    => emitter.on(ev, cb),
@@ -720,23 +783,98 @@ class WebBleIpcBinding extends EventEmitter {
         return props
     }
 
-    async _subscribeCharacteristic(char, callback) {
+    /**
+     * The characteristic object of the *current* GATT connection. After a reconnect
+     * Chromium creates new characteristic objects and dispatches notifications only to
+     * those — but the devices layer keeps using the wrapper (and so the object) from
+     * the first discovery. Re-resolving through the live server and swapping it into
+     * the wrapper keeps notifications (and reads/writes) on a live object.
+     */
+    async _currentBleChar(char) {
+        const server = char._peripheral?._server
+        const serviceUuid = char._bleChar?.service?.uuid
+        if (!server?.connected || !serviceUuid) return char._bleChar
         try {
-            await char._bleChar.startNotifications()
-            char._bleChar.addEventListener('characteristicvaluechanged', (event) => {
-                const value = event.target.value
-                const data = Buffer.from(value.buffer)
-                char.emit('data', data, true)
+            const service = await server.getPrimaryService(serviceUuid)
+            const current = await service.getCharacteristic(char._bleChar.uuid)
+            if (current && current !== char._bleChar) {
+                this._log({ message: 'characteristic re-resolved on current connection', uuid: char.uuid, debug: true })
+                char._bleChar = current
+            }
+        } catch {}
+        return char._bleChar
+    }
+
+    /**
+     * Runs start/stop notification operations of one Chromium characteristic strictly one
+     * after another. Chromium crashes (null dereference in BluetoothGattNotifySession::Stop)
+     * when stopNotifications() hits a characteristic whose session isn't established yet,
+     * e.g. while a startNotifications() of another wrapper is still in flight.
+     */
+    _queueNotifyOp(bleChar, op) {
+        const next = (bleChar._incyclistNotifyQueue ?? Promise.resolve()).catch(() => {}).then(op)
+        bleChar._incyclistNotifyQueue = next.catch(() => {})
+        return next
+    }
+
+    async _subscribeCharacteristic(char, callback) {
+        const t0 = Date.now()
+        const bleChar = await this._currentBleChar(char)
+        try {
+            await this._queueNotifyOp(bleChar, async () => {
+                const server = char._peripheral?._server
+                const notify = bleChar._incyclistNotify
+                if (notify && notify.server === server && server?.connected !== false)
+                    return  // already notifying on this connection - just add the wrapper
+
+                // After a reconnect Chromium (at least on Linux/BlueZ) still considers the
+                // previous notification session active: startNotifications() then resolves
+                // at once without re-enabling notifications on the device, and no data ever
+                // arrives. So a session started on an earlier connection is stopped first -
+                // but never one this app didn't start (see _queueNotifyOp).
+                if (notify) {
+                    try { await bleChar.stopNotifications() } catch {}
+                    bleChar._incyclistNotify = undefined
+                }
+                await bleChar.startNotifications()
+                bleChar._incyclistNotify = { server }
             })
+            this._log({ message: 'subscribed', uuid: char.uuid, durationMs: Date.now() - t0, debug: true })
+
+            // Chromium hands out the same characteristic object again after a reconnect,
+            // while the devices layer may keep listening on the wrapper it got first. So
+            // one listener per Chromium characteristic forwards to every wrapper that
+            // subscribed to it — no stacked listeners, no wrapper left without data.
+            if (!bleChar._incyclistWrappers) {
+                bleChar._incyclistWrappers = new Set()
+                bleChar.addEventListener('characteristicvaluechanged', (event) => {
+                    const data = Buffer.from(event.target.value.buffer)
+                    for (const wrapper of bleChar._incyclistWrappers)
+                        wrapper.emit('data', data, true)
+                })
+            }
+            bleChar._incyclistWrappers.add(char)
             if (callback) callback(null)
         } catch (err) {
+            this._log({ message: 'subscribe failed', uuid: char.uuid, error: err?.message, durationMs: Date.now() - t0 })
             if (callback) callback(err)
         }
     }
 
     async _unsubscribeCharacteristic(char, callback) {
+        const bleChar = char._bleChar
+        // stop forwarding to this wrapper, even if another wrapper (re)subscribes later
+        bleChar?._incyclistWrappers?.delete(char)
         try {
-            await char._bleChar.stopNotifications()
+            if (bleChar) {
+                await this._queueNotifyOp(bleChar, async () => {
+                    // other wrappers still listen, or nothing was started: leave it alone
+                    if (bleChar._incyclistWrappers?.size || !bleChar._incyclistNotify)
+                        return
+                    bleChar._incyclistNotify = undefined
+                    await bleChar.stopNotifications()
+                })
+            }
             if (callback) callback(null)
         } catch (err) {
             if (callback) callback(err)

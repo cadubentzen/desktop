@@ -863,6 +863,7 @@ describe('WebBleIpcBinding — _processDiscoveredDevice', () => {
     test('emits discover even when no fitness services are found', async () => {
         const server = makeGattServer([])
         const device = makeBleDevice('dev-1', 'Unknown BLE', server)
+        device.gatt.connect.mockImplementation(async () => { device.gatt.connected = true; return server })
 
         const discovered = []
         binding.on('discover', p => discovered.push(p))
@@ -871,6 +872,24 @@ describe('WebBleIpcBinding — _processDiscoveredDevice', () => {
 
         expect(discovered).toHaveLength(1)
         expect(discovered[0].advertisement.serviceUuids).toEqual([])
+    })
+
+    test('no services from a server that dropped the link is a probe failure, not an unsupported device', async () => {
+        // e.g. a stale connection reused right after a previous probe gave up: connect()
+        // resolves at once, then every service lookup fails as the link goes down
+        const server = makeGattServer([])
+        server.getPrimaryServices.mockRejectedValue(new Error('GATT Server is disconnected.'))
+        const device = makeBleDevice('dev-1', 'HRM-Pro:935280', server)   // gatt.connected stays false
+
+        const discovered = []
+        binding.on('discover', p => discovered.push(p))
+
+        await binding._processDiscoveredDevice(device, true)
+
+        expect(discovered).toHaveLength(0)
+        expect(api.reportProbeFailed).toHaveBeenCalledWith('dev-1', 'HRM-Pro:935280')
+        expect(api.reportUnsupportedDevice).not.toHaveBeenCalled()
+        expect(binding._deviceCache.get('dev-1').probed).toBe(false)
     })
 
     test('falls back to per-UUID probing when getPrimaryServices throws (e.g. Wahoo KICKR)', async () => {
@@ -971,6 +990,82 @@ describe('WebBleIpcBinding — _processDiscoveredDevice', () => {
 })
 
 // ── _connectPeripheral ────────────────────────────────────────────────────────
+
+describe('WebBleIpcBinding — probing devices we already use', () => {
+
+    let binding, api
+
+    beforeEach(() => {
+        api = makeApi({ takeApproved: jest.fn().mockReturnValue('D0:C8:C1:47:D5:24'), isWantedDevice: jest.fn().mockReturnValue(true) })
+        binding = new WebBleIpcBinding()
+        binding.setApi(api)
+        binding._gattRetryDelayMs = 1
+    })
+
+    test('the probe runs in the background, so the scan loop is not blocked', async () => {
+        let resolveServices
+        const server = makeGattServer([])
+        server.getPrimaryServices.mockReturnValue(new Promise(r => { resolveServices = r }))
+        const device = makeBleDevice('opaque-1', 'HRM-Pro:935280', server)
+        device.gatt.connect.mockImplementation(async () => { device.gatt.connected = true; return server })
+        const discovered = []
+        binding.on('discover', p => discovered.push(p))
+
+        await binding._processDiscoveredDevice(device, true)   // returns while the probe is still running
+        expect(api.isWantedDevice).toHaveBeenCalledWith('D0:C8:C1:47:D5:24')
+        expect(discovered).toHaveLength(0)
+
+        resolveServices([{ uuid: '0000180d-0000-1000-8000-00805f9b34fb' }])
+        await new Promise(r => setImmediate(r))
+
+        expect(discovered).toHaveLength(1)
+        expect(discovered[0].id).toBe('D0:C8:C1:47:D5:24')
+        expect(discovered[0].advertisement.serviceUuids).toEqual(['180d'])
+    })
+
+    test('uses the long probe timeout', async () => {
+        const spy = jest.spyOn(binding, '_probeServices').mockResolvedValue(['180d'])
+        await binding._processDiscoveredDevice(makeBleDevice('opaque-1', 'HRM-Pro:935280'), true)
+        expect(spy).toHaveBeenCalledWith(expect.anything(), binding._knownDeviceProbeTimeoutMs)
+    })
+
+    test('an unknown device keeps the short timeout and is awaited', async () => {
+        api.isWantedDevice.mockReturnValue(false)
+        const spy = jest.spyOn(binding, '_probeServices').mockResolvedValue(['180d'])
+        const discovered = []
+        binding.on('discover', p => discovered.push(p))
+
+        await binding._processDiscoveredDevice(makeBleDevice('opaque-1', 'HRM-Pro:935280'), true)
+
+        expect(spy).toHaveBeenCalledWith(expect.anything(), binding._probeTimeoutMs)
+        expect(discovered).toHaveLength(1)
+    })
+
+    test('a second approval while the probe is still running does not start another probe', async () => {
+        const spy = jest.spyOn(binding, '_probeServices').mockReturnValue(new Promise(() => {}))
+        const device = makeBleDevice('opaque-1', 'HRM-Pro:935280')
+
+        await binding._processDiscoveredDevice(device, true)
+        await binding._processDiscoveredDevice(device, true)
+
+        expect(spy).toHaveBeenCalledTimes(1)
+    })
+
+    test('a slow service discovery is logged (not as debug)', async () => {
+        binding._slowDiscoveryLogMs = -1
+        api.isWantedDevice.mockReturnValue(false)
+        const server = makeGattServer(['180d'])
+        const device = makeBleDevice('opaque-1', 'HRM-Pro:935280', server)
+        device.gatt.connect.mockImplementation(async () => { device.gatt.connected = true; return server })
+
+        await binding._processDiscoveredDevice(device, true)
+
+        const ev = api.log.mock.calls.map(c => c[0]).find(e => e.message === 'slow GATT service discovery')
+        expect(ev).toEqual(expect.objectContaining({ device: 'HRM-Pro:935280' }))
+        expect(ev.debug).toBeUndefined()
+    })
+
+})
 
 describe('WebBleIpcBinding — _connectPeripheral', () => {
 
@@ -1268,6 +1363,229 @@ describe('WebBleIpcBinding — _disconnectPeripheral', () => {
 })
 
 // ── discovery: noble semantics (empty list = all) and uuid formats ────────────
+
+describe('WebBleIpcBinding — _subscribeCharacteristic', () => {
+
+    const makeBleChar = () => {
+        const listeners = new Set()
+        return {
+            uuid: '00002a37-0000-1000-8000-00805f9b34fb',
+            startNotifications: jest.fn().mockResolvedValue(),
+            stopNotifications: jest.fn().mockResolvedValue(),
+            addEventListener: jest.fn((ev, l) => listeners.add(l)),
+            removeEventListener: jest.fn((ev, l) => listeners.delete(l)),
+            fire: (bytes) => listeners.forEach(l => l({ target: { value: { buffer: new Uint8Array(bytes).buffer } } })),
+        }
+    }
+
+    let binding
+    beforeEach(() => {
+        binding = new WebBleIpcBinding()
+        binding.setApi(makeApi())
+    })
+
+    // Chromium crashes (null dereference in BluetoothGattNotifySession::Stop) when
+    // stopNotifications() hits a characteristic without an established session - e.g. one
+    // that was never started, or whose start is still in flight
+    test('never stops notifications on a characteristic it has not started', async () => {
+        const bleChar = makeBleChar()
+        const char = binding._createCharacteristic(bleChar, { id: 'D0:C8:C1:47:D5:24' })
+        const cb = jest.fn()
+
+        await char.subscribe(cb)
+
+        expect(bleChar.stopNotifications).not.toHaveBeenCalled()
+        expect(bleChar.startNotifications).toHaveBeenCalledTimes(1)
+        expect(cb).toHaveBeenCalledWith(null)
+    })
+
+    test('after a reconnect, the session from the previous connection is stopped before starting again', async () => {
+        const bleChar = makeBleChar()
+        const peripheral = { id: 'p1', _server: { connected: true } }
+        const char = binding._createCharacteristic(bleChar, peripheral)
+        await char.subscribe()
+
+        peripheral._server = { connected: true }    // reconnected: a new GATT server
+        await char.subscribe()
+
+        expect(bleChar.stopNotifications).toHaveBeenCalledTimes(1)
+        expect(bleChar.stopNotifications.mock.invocationCallOrder[0])
+            .toBeLessThan(bleChar.startNotifications.mock.invocationCallOrder[1])
+    })
+
+    test('a failing stop of a stale session does not prevent subscribing', async () => {
+        const bleChar = makeBleChar()
+        const peripheral = { id: 'p1', _server: { connected: true } }
+        const char = binding._createCharacteristic(bleChar, peripheral)
+        await char.subscribe()
+        bleChar.stopNotifications.mockRejectedValue(new Error('not notifying'))
+        peripheral._server = { connected: true }
+        const cb = jest.fn()
+
+        await char.subscribe(cb)
+
+        expect(bleChar.startNotifications).toHaveBeenCalledTimes(2)
+        expect(cb).toHaveBeenCalledWith(null)
+    })
+
+    test('a 2nd wrapper subscribing to an active characteristic does not restart its notifications', async () => {
+        const bleChar = makeBleChar()
+        const peripheral = { id: 'p1', _server: { connected: true } }
+        const first = binding._createCharacteristic(bleChar, peripheral)
+        const second = binding._createCharacteristic(bleChar, peripheral)
+        const data = jest.fn()
+        second.on('data', data)
+
+        await first.subscribe()
+        await second.subscribe()
+        bleChar.fire([0x07])
+
+        expect(bleChar.startNotifications).toHaveBeenCalledTimes(1)
+        expect(bleChar.stopNotifications).not.toHaveBeenCalled()
+        expect(data).toHaveBeenCalledTimes(1)
+    })
+
+    test('concurrent subscriptions never stop a session whose start is still in flight', async () => {
+        const bleChar = makeBleChar()
+        let finishStart
+        bleChar.startNotifications.mockImplementationOnce(() => new Promise(resolve => { finishStart = resolve }))
+        const peripheral = { id: 'p1', _server: { connected: true } }
+        const first = binding._createCharacteristic(bleChar, peripheral)
+        const second = binding._createCharacteristic(bleChar, peripheral)
+
+        const p1 = first.subscribe()
+        const p2 = second.subscribe()
+        await new Promise(r => setImmediate(r))
+        expect(bleChar.stopNotifications).not.toHaveBeenCalled()
+
+        finishStart()
+        await Promise.all([p1, p2])
+        expect(bleChar.stopNotifications).not.toHaveBeenCalled()
+        expect(bleChar.startNotifications).toHaveBeenCalledTimes(1)
+    })
+
+    test('notifications are only stopped when the last wrapper unsubscribes', async () => {
+        const bleChar = makeBleChar()
+        const peripheral = { id: 'p1', _server: { connected: true } }
+        const first = binding._createCharacteristic(bleChar, peripheral)
+        const second = binding._createCharacteristic(bleChar, peripheral)
+        await first.subscribe()
+        await second.subscribe()
+
+        await first.unsubscribe()
+        expect(bleChar.stopNotifications).not.toHaveBeenCalled()
+
+        await second.unsubscribe()
+        expect(bleChar.stopNotifications).toHaveBeenCalledTimes(1)
+    })
+
+    test('unsubscribing a characteristic that was never started does not call stopNotifications', async () => {
+        const bleChar = makeBleChar()
+        const char = binding._createCharacteristic(bleChar, { id: 'p1' })
+        const cb = jest.fn()
+
+        await char.unsubscribe(cb)
+
+        expect(bleChar.stopNotifications).not.toHaveBeenCalled()
+        expect(cb).toHaveBeenCalledWith(null)
+    })
+
+    test('emits notifications as data', async () => {
+        const bleChar = makeBleChar()
+        const char = binding._createCharacteristic(bleChar, { id: 'p1' })
+        const received = []
+        char.on('data', (data, isNotification) => received.push([...data, isNotification]))
+
+        await char.subscribe()
+        bleChar.fire([0x16, 0x4c])
+
+        expect(received).toEqual([[0x16, 0x4c, true]])
+    })
+
+    test('re-subscribing the same characteristic object (after a reconnect) feeds every wrapper exactly once', async () => {
+        // the devices layer may keep listening on the wrapper from the first discovery
+        const bleChar = makeBleChar()
+        const oldChar = binding._createCharacteristic(bleChar, { id: 'p1' })
+        const newChar = binding._createCharacteristic(bleChar, { id: 'p1' })
+        const oldData = jest.fn(), newData = jest.fn()
+        oldChar.on('data', oldData)
+        newChar.on('data', newData)
+
+        await oldChar.subscribe()
+        await newChar.subscribe()
+        await oldChar.subscribe()     // subscribing a wrapper again must not duplicate its data
+        bleChar.fire([0x16, 0x4c])
+
+        expect(bleChar.addEventListener).toHaveBeenCalledTimes(1)
+        expect(oldData).toHaveBeenCalledTimes(1)
+        expect(newData).toHaveBeenCalledTimes(1)
+    })
+
+    test('after a reconnect, subscribes on the characteristic object of the current connection', async () => {
+        // Chromium creates new characteristic objects per connection and dispatches
+        // notifications only to those; the devices layer keeps the first wrapper
+        const stale = makeBleChar()
+        stale.service = { uuid: '0000180d-0000-1000-8000-00805f9b34fb' }
+        const current = makeBleChar()
+        const server = {
+            connected: true,
+            getPrimaryService: jest.fn().mockResolvedValue({ getCharacteristic: jest.fn().mockResolvedValue(current) }),
+        }
+        const peripheral = { id: 'p1', _server: server }
+        const char = binding._createCharacteristic(stale, peripheral)
+        const received = jest.fn()
+        char.on('data', received)
+
+        await char.subscribe()
+        current.fire([0x16, 0x4c])
+
+        expect(server.getPrimaryService).toHaveBeenCalledWith('0000180d-0000-1000-8000-00805f9b34fb')
+        expect(current.startNotifications).toHaveBeenCalled()
+        expect(stale.startNotifications).not.toHaveBeenCalled()
+        expect(char._bleChar).toBe(current)
+        expect(received).toHaveBeenCalledTimes(1)
+    })
+
+    test('keeps the known characteristic object when it cannot be re-resolved', async () => {
+        const bleChar = makeBleChar()
+        bleChar.service = { uuid: '0000180d-0000-1000-8000-00805f9b34fb' }
+        const server = { connected: true, getPrimaryService: jest.fn().mockRejectedValue(new Error('GATT Server is disconnected.')) }
+        const char = binding._createCharacteristic(bleChar, { id: 'p1', _server: server })
+
+        await char.subscribe()
+
+        expect(bleChar.startNotifications).toHaveBeenCalled()
+    })
+
+    test('a wrapper that unsubscribed gets no more data, even when another wrapper subscribes', async () => {
+        const bleChar = makeBleChar()
+        const oldChar = binding._createCharacteristic(bleChar, { id: 'p1' })
+        const newChar = binding._createCharacteristic(bleChar, { id: 'p1' })
+        const oldData = jest.fn(), newData = jest.fn()
+        oldChar.on('data', oldData)
+        newChar.on('data', newData)
+
+        await oldChar.subscribe()
+        await oldChar.unsubscribe()
+        await newChar.subscribe()
+        bleChar.fire([0x16, 0x4c])
+
+        expect(oldData).not.toHaveBeenCalled()
+        expect(newData).toHaveBeenCalledTimes(1)
+    })
+
+    test('reports a startNotifications failure to the callback', async () => {
+        const bleChar = makeBleChar()
+        bleChar.startNotifications.mockRejectedValue(new Error('GATT operation failed'))
+        const char = binding._createCharacteristic(bleChar, { id: 'p1' })
+        const cb = jest.fn()
+
+        await char.subscribe(cb)
+
+        expect(cb).toHaveBeenCalledWith(expect.objectContaining({ message: 'GATT operation failed' }))
+    })
+
+})
 
 describe('WebBleIpcBinding — discovery noble semantics', () => {
 
