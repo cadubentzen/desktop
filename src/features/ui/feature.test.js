@@ -145,3 +145,47 @@ describe('NativeUISupport.toggleFullScreen', () => {
     })
 
 })
+
+describe('NativeUISupport.takeScreenshot', () => {
+
+    const fsSync = require('fs')
+    const path = require('path')
+    const os = require('os')
+    let instance
+    let root
+
+    beforeEach(() => {
+        root = fsSync.mkdtempSync(path.join(os.tmpdir(), 'screenshots-'))
+        instance = NativeUISupport.getInstance()
+        instance.setLogger({ logEvent: jest.fn() })
+        const win = { capturePage: jest.fn().mockResolvedValue({ toJPEG: () => Buffer.from('jpeg') }) }
+        app.incyclistApp = { getWindowManager: () => ({ getActiveWindow: () => win }) }
+        app.getPath = jest.fn((name) => path.join(root, name))
+    })
+
+    afterEach(() => {
+        fsSync.rmSync(root, { recursive: true, force: true })
+        jest.clearAllMocks()
+    })
+
+    test('saves the screenshot in the album folder of the user\'s pictures', async () => {
+        const fullPath = await instance.takeScreenshot({ fileName: 'screenshot-1.jpg', album: '2026-11-03 Mensac Loop' })
+
+        expect(app.getPath).toHaveBeenCalledWith('pictures')
+        expect(fullPath).toBe(path.join(root, 'pictures', 'Incyclist', '2026-11-03 Mensac Loop', 'screenshot-1.jpg'))
+        expect(fsSync.readFileSync(fullPath, 'utf8')).toBe('jpeg')
+    })
+
+    test('characters that are not allowed in folder names or file URLs are left out of the album folder', async () => {
+        const fullPath = await instance.takeScreenshot({ fileName: 'screenshot-1.jpg', album: '2026-11-03 Col: A/B #1? <test>.' })
+
+        expect(path.basename(path.dirname(fullPath))).toBe('2026-11-03 Col A B 1 test')
+    })
+
+    test('without an album, the screenshot goes to the app\'s screenshots folder', async () => {
+        const fullPath = await instance.takeScreenshot({ fileName: 'screenshot-1.jpg' })
+
+        expect(path.basename(path.dirname(fullPath))).toBe('screenshots')
+        expect(fullPath.startsWith(path.join(root, 'pictures'))).toBe(false)
+    })
+})

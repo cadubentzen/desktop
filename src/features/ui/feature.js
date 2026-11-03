@@ -104,26 +104,42 @@ class NativeUISupport extends Feature {
  
   async takeScreenshot(props) {
     const JPEG_QUALITY_DEFAULT = 70; 
-    const {fileName = 'screenshot'} = props
+    const {fileName = 'screenshot', album} = props??{}
         
     let win = app.incyclistApp.getWindowManager().getActiveWindow();
     let img = await win.capturePage();            
     let data = img.toJPEG(JPEG_QUALITY_DEFAULT)
-    const appDir = getAppDirectory()
-    
-    const screenShotDir = path.join(appDir,'./screenshots')
-    checkDir(screenShotDir);
-    const fullPath = path.join( screenShotDir,`./${fileName}` )
-    try {
+
+    // the album's folder in the user's pictures (e.g. ~/Pictures/Incyclist/2026-11-03 Mensac Loop),
+    // the app's screenshots folder if there is no album - or it can't be written
+    const dirs = [ this.getAlbumDirectory(album), path.join(getAppDirectory(),'./screenshots') ].filter(Boolean)
+    for (const dir of dirs) {
+      const fullPath = path.join( dir,`./${fileName}` )
+      try {
+        checkDir(dir);
         await fs.writeFile(fullPath, data)
+        return fullPath
+      }
+      catch(err) {
+        this.logger.logEvent( {message:'error',fn:'takeScreenshot()',dir,error:err.message||err, stack:err.stack})
+      }
     }
-    catch(err) {
-      this.logger.logEvent( {message:'error',fn:'takeScreenshot()',error:err.message||err, stack:errstack})
+    return null
+  }
+
+  getAlbumDirectory(album) {
+    // left out: what isn't allowed in folder names (Windows being the strictest) or breaks the
+    // incyclist:// URLs the screenshots are shown with (#, ?, %)
+    const name = (album??'').replace(/[<>:"/\\|?*#%\u0000-\u001f]/g,' ')
+      .replace(/\s+/g,' ').trim().replace(/[. ]+$/,'').slice(0,120).trim()
+    if (!name)
+      return undefined
+    try {
+      return path.join(app.getPath('pictures'),'Incyclist',name)
     }
-
-    return fullPath
-
-
+    catch {
+      return undefined
+    }
   }
 
   quitRequest() {
